@@ -3,15 +3,18 @@
 // Creates the Adwaita application, builds the main window with:
 //   • an Adwaita HeaderBar with a hamburger menu,
 //   • a quick-search bar (activated with Ctrl+F),
-//   • a GtkNotebook for multiple editor tabs,
-//   • a status bar showing cursor position and character count.
+//   • a split-pane grid (auto-layout: 1 pane full, 2 side-by-side, 3+ in rows of 2),
+//   • a status bar showing cursor position.
 //
-// File, Edit and Tools actions wire together the editor, formatter, and diff
-// modules defined in the companion source files.
+// Vertical separators between panes in the same row have a chain-link toggle
+// button that synchronises the scroll of the two adjacent panes.
 
 mod diff;
 mod editor;
 mod formatter;
+
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 
 use gtk4::gio;
 use gtk4::glib;
@@ -21,6 +24,33 @@ use adw::prelude::*;
 use sourceview5::prelude::*;
 
 const APP_ID: &str = "com.tuxpad.TuxPad";
+
+// ─── Types ───────────────────────────────────────────────────────────────────
+
+/// A list of (Adjustment, SignalHandlerId) pairs used to disconnect scroll sync.
+type HandlerList = Rc<RefCell<Vec<(gtk4::Adjustment, glib::SignalHandlerId)>>>;
+
+/// Shared mutable state for the split-pane layout.
+type State = Rc<RefCell<SplitState>>;
+
+struct PaneData {
+    /// Outer container widget: pane header + scrolled window.
+    root: gtk4::Box,
+    /// The scrolled window (kept for scroll-sync access).
+    scrolled: gtk4::ScrolledWindow,
+    /// The underlying editor view.
+    editor: editor::EditorView,
+    /// Filename label shown in the pane header.
+    label: gtk4::Label,
+}
+
+struct SplitState {
+    panes: Vec<PaneData>,
+    /// Root widget of the currently focused pane (used by actions).
+    active: Option<gtk4::Box>,
+    /// One HandlerList per currently linked separator.
+    active_handler_lists: Vec<HandlerList>,
+}
 
 // ─── Application entry point ─────────────────────────────────────────────────
 
@@ -33,7 +63,6 @@ fn main() -> glib::ExitCode {
 // ─── UI builder ──────────────────────────────────────────────────────────────
 
 fn build_ui(app: &adw::Application) {
-    // Initialise GtkSourceView type system (must happen after GTK is ready)
     sourceview5::init();
     let window = build_main_window(app);
     window.present();
@@ -54,13 +83,11 @@ fn build_main_window(app: &adw::Application) -> adw::ApplicationWindow {
     // ── Header bar ------------------------------------------------------------
     let header_bar = adw::HeaderBar::new();
 
-    // "New tab" button in the header
-    let new_tab_button = gtk4::Button::new();
-    new_tab_button.set_icon_name("tab-new-symbolic");
-    new_tab_button.set_tooltip_text(Some("New Tab (Ctrl+T)"));
-    header_bar.pack_start(&new_tab_button);
+    let new_pane_button = gtk4::Button::new();
+    new_pane_button.set_icon_name("tab-new-symbolic");
+    new_pane_button.set_tooltip_text(Some("New Pane (Ctrl+T)"));
+    header_bar.pack_start(&new_pane_button);
 
-    // Hamburger menu
     let menu_button = gtk4::MenuButton::new();
     menu_button.set_icon_name("open-menu-symbolic");
     let menu_model = build_app_menu();
@@ -96,22 +123,16 @@ fn build_main_window(app: &adw::Application) -> adw::ApplicationWindow {
     search_row.append(&next_button);
     search_row.append(&match_label);
     search_bar.set_child(Some(&search_row));
-    // Forward key strokes to the search bar so typing opens it automatically
     search_bar.connect_entry(&search_entry);
 
     root_box.append(&search_bar);
 
-    // ── Notebook (tabs) -------------------------------------------------------
-    let notebook = gtk4::Notebook::new();
-    notebook.set_vexpand(true);
-    notebook.set_tab_pos(gtk4::PositionType::Top);
-    notebook.set_scrollable(true);
-    notebook.set_show_border(false);
+    // ── Split-pane container --------------------------------------------------
+    let outer_panes_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    outer_panes_box.set_vexpand(true);
+    outer_panes_box.set_hexpand(true);
 
-    // Open with one blank tab
-    add_new_tab(&notebook, None);
-
-    root_box.append(&notebook);
+    root_box.append(&outer_panes_box);
 
     // ── Status bar ------------------------------------------------------------
     let status_bar = gtk4::Label::new(Some("Ln 1, Col 1"));
@@ -129,14 +150,31 @@ fn build_main_window(app: &adw::Application) -> adw::ApplicationWindow {
     // ── Assemble window -------------------------------------------------------
     window.set_content(Some(&root_box));
 
+    // ── Initial split state ---------------------------------------------------
+    let state: State = Rc::new(RefCell::new(SplitState {
+        panes: Vec::new(),
+        active: None,
+        active_handler_lists: Vec::new(),
+    }));
+
+    // Open with one blank pane
+    add_pane(&outer_panes_box, &state, &status_bar, None);
+
     // ── Keyboard shortcuts ----------------------------------------------------
-    setup_shortcuts(&window, &notebook, &search_bar);
+    setup_shortcuts(&window, &outer_panes_box, &state, &status_bar, &search_bar);
 
     // ── Actions ---------------------------------------------------------------
-    setup_actions(&window, &notebook, &search_entry, &match_label);
+    setup_actions(
+        &window,
+        &outer_panes_box,
+        &state,
+        &status_bar,
+        &search_entry,
+        &match_label,
+    );
 
-    // Connect new-tab button to win.new_tab action
-    new_tab_button.connect_clicked({
+    // Connect new-pane button to win.new_tab action
+    new_pane_button.connect_clicked({
         let window = window.clone();
         move |_| {
             if let Some(action) = window.lookup_action("new_tab") {
@@ -144,14 +182,6 @@ fn build_main_window(app: &adw::Application) -> adw::ApplicationWindow {
             }
         }
     });
-
-    // Update status bar when cursor moves in the active editor
-    {
-        let status_bar_clone = status_bar.clone();
-        notebook.connect_switch_page(move |nb, _page_widget, page_num| {
-            connect_cursor_moved(nb, page_num, &status_bar_clone);
-        });
-    }
 
     window
 }
@@ -162,7 +192,7 @@ fn build_app_menu() -> gio::Menu {
     let menu = gio::Menu::new();
 
     let file_section = gio::Menu::new();
-    file_section.append(Some("New Tab"), Some("win.new_tab"));
+    file_section.append(Some("New Pane"), Some("win.new_tab"));
     file_section.append(Some("Open File…"), Some("win.open_file"));
     file_section.append(Some("Save"), Some("win.save_file"));
     file_section.append(Some("Save As…"), Some("win.save_file_as"));
@@ -180,36 +210,31 @@ fn build_app_menu() -> gio::Menu {
     menu
 }
 
-// ─── Tab helpers ─────────────────────────────────────────────────────────────
+// ─── Pane helpers ─────────────────────────────────────────────────────────────
 
-/// Add a new editor tab to `notebook`.
+/// Create a new `PaneData` for a single editor pane.
 ///
-/// * `file_path` – if `Some`, the file is loaded and the tab is labelled with
-///   the file name; otherwise the tab is labelled `"Untitled"`.
-///
-/// Returns the `EditorView` so the caller can perform further operations.
-fn add_new_tab(
-    notebook: &gtk4::Notebook,
+/// Builds the header (label + close button), wraps the editor in a vertical Box,
+/// and connects the status-bar cursor signal and focus tracking.
+fn create_pane_data(
+    outer_box: &gtk4::Box,
+    state: &State,
+    status_bar: &gtk4::Label,
     file_path: Option<&std::path::Path>,
-) -> editor::EditorView {
-    let mut editor_view = editor::EditorView::new();
+) -> PaneData {
+    let mut ev = editor::EditorView::new();
 
     let label_text = if let Some(path) = file_path {
-        match editor_view.open_file(path) {
+        match ev.open_file(path) {
             Ok(()) => {
-                // Persist the path as GObject data so actions (Save, Format…) can
-                // retrieve it without needing to carry the EditorView separately.
-                let stored_path: std::path::PathBuf = path.to_path_buf();
-                unsafe {
-                    editor_view.view().set_data("file_path", stored_path);
-                }
+                unsafe { ev.view().set_data("file_path", path.to_path_buf()); }
                 path.file_name()
                     .and_then(|n| n.to_str())
                     .unwrap_or("Untitled")
                     .to_owned()
             }
-            Err(err) => {
-                eprintln!("Error opening file: {}", err);
+            Err(e) => {
+                eprintln!("Error opening file: {}", e);
                 "Untitled".to_owned()
             }
         }
@@ -217,99 +242,332 @@ fn add_new_tab(
         "Untitled".to_owned()
     };
 
-    // Tab label with a close button
-    let tab_label = build_tab_label(&label_text, notebook, editor_view.widget());
-
-    let page_index = notebook.append_page(editor_view.widget(), Some(&tab_label));
-    notebook.set_tab_reorderable(editor_view.widget(), true);
-    notebook.set_current_page(Some(page_index));
-
-    editor_view
-}
-
-/// Build a tab label widget: `[filename] [✕]`
-fn build_tab_label(
-    text: &str,
-    notebook: &gtk4::Notebook,
-    page_widget: &gtk4::ScrolledWindow,
-) -> gtk4::Box {
-    let tab_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
-
-    let label = gtk4::Label::new(Some(text));
+    // Header
+    let label = gtk4::Label::new(Some(&label_text));
     label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
     label.set_max_width_chars(20);
+    label.set_hexpand(true);
+    label.set_xalign(0.0);
 
     let close_btn = gtk4::Button::new();
     close_btn.set_icon_name("window-close-symbolic");
     close_btn.set_has_frame(false);
     close_btn.add_css_class("flat");
-    close_btn.set_tooltip_text(Some("Close tab"));
+    close_btn.set_tooltip_text(Some("Close pane"));
 
+    let header = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+    header.set_margin_start(4);
+    header.set_margin_end(4);
+    header.set_margin_top(2);
+    header.set_margin_bottom(2);
+    header.append(&label);
+    header.append(&close_btn);
+
+    // Pane root
+    let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    root.set_hexpand(true);
+    root.set_vexpand(true);
+    root.append(&header);
+    root.append(ev.widget());
+
+    let scrolled = ev.widget().clone();
+
+    // Close button → remove_pane
     {
-        let nb = notebook.clone();
-        let pw = page_widget.clone();
+        let ob = outer_box.clone();
+        let st = state.clone();
+        let root_clone = root.clone();
         close_btn.connect_clicked(move |_| {
-            if let Some(index) = nb.page_num(&pw) {
-                nb.remove_page(Some(index));
-            }
+            remove_pane(&ob, &st, &root_clone);
         });
     }
 
-    tab_box.append(&label);
-    tab_box.append(&close_btn);
-    tab_box
-}
-
-/// Returns the `sourceview5::View` of the currently active tab, if any.
-fn current_source_view(notebook: &gtk4::Notebook) -> Option<sourceview5::View> {
-    use sourceview5::prelude::*;
-
-    let page_index = notebook.current_page()?;
-    let scrolled = notebook
-        .nth_page(Some(page_index))?
-        .downcast::<gtk4::ScrolledWindow>()
-        .ok()?;
-    scrolled
-        .child()?
-        .downcast::<sourceview5::View>()
-        .ok()
-}
-
-// ─── Status bar helper ────────────────────────────────────────────────────────
-
-/// Connect a cursor-moved signal on the active tab's buffer to `status_bar`.
-fn connect_cursor_moved(
-    notebook: &gtk4::Notebook,
-    page_num: u32,
-    status_bar: &gtk4::Label,
-) {
-    if let Some(view) = {
-        use sourceview5::prelude::*;
-        notebook
-            .nth_page(Some(page_num))
-            .and_then(|w| w.downcast::<gtk4::ScrolledWindow>().ok())
-            .and_then(|sw| sw.child())
-            .and_then(|c| c.downcast::<sourceview5::View>().ok())
-    } {
-        let status_clone = status_bar.clone();
-        view.buffer().connect_mark_set(move |buf, iter, mark| {
+    // Status bar update on cursor move
+    {
+        let status = status_bar.clone();
+        ev.view().buffer().connect_mark_set(move |buf, iter, mark| {
             if mark.name().as_deref() == Some("insert") {
                 let line = iter.line() + 1;
                 let col = buf
                     .iter_at_line_offset(iter.line(), 0)
                     .map(|start| iter.offset() - start.offset() + 1)
                     .unwrap_or(1);
-                status_clone.set_text(&format!("Ln {}, Col {}", line, col));
+                status.set_text(&format!("Ln {}, Col {}", line, col));
             }
         });
     }
+
+    // Track active pane when the editor gains focus
+    {
+        let st = state.clone();
+        let root_clone = root.clone();
+        ev.view().connect_has_focus_notify(move |view| {
+            if view.has_focus() {
+                st.borrow_mut().active = Some(root_clone.clone());
+            }
+        });
+    }
+
+    PaneData { root, scrolled, editor: ev, label }
+}
+
+/// Add a new pane to the layout, optionally opening `file_path`.
+fn add_pane(
+    outer_box: &gtk4::Box,
+    state: &State,
+    status_bar: &gtk4::Label,
+    file_path: Option<&std::path::Path>,
+) {
+    let pane = create_pane_data(outer_box, state, status_bar, file_path);
+    {
+        let mut s = state.borrow_mut();
+        let root = pane.root.clone();
+        s.panes.push(pane);
+        s.active = Some(root);
+    }
+    rebuild_layout(outer_box, state);
+}
+
+/// Remove the pane whose root matches `root`. Guards against closing the last pane.
+fn remove_pane(outer_box: &gtk4::Box, state: &State, root: &gtk4::Box) {
+    let (panes_len, idx) = {
+        let s = state.borrow();
+        let len = s.panes.len();
+        let idx = s.panes.iter().position(|p| p.root == *root);
+        (len, idx)
+    };
+
+    if panes_len <= 1 {
+        return; // Keep at least one pane
+    }
+
+    if let Some(idx) = idx {
+        let new_active_idx = if idx > 0 { idx - 1 } else { 1 };
+        let new_active = state.borrow().panes[new_active_idx].root.clone();
+        {
+            let mut s = state.borrow_mut();
+            s.active = Some(new_active);
+            s.panes.remove(idx);
+        }
+        rebuild_layout(outer_box, state);
+    }
+}
+
+/// Disconnect all scroll-sync handlers, clear the container, and rebuild the
+/// grid layout from the current pane list in chunks of two per row.
+fn rebuild_layout(outer_box: &gtk4::Box, state: &State) {
+    // 1. Disconnect all scroll-sync handlers
+    {
+        let mut s = state.borrow_mut();
+        for hl in s.active_handler_lists.drain(..) {
+            for (adj, id) in hl.borrow_mut().drain(..) {
+                adj.disconnect(id);
+            }
+        }
+    }
+
+    // 2. Unparent all pane roots from their current row_boxes
+    {
+        let s = state.borrow();
+        for pane in &s.panes {
+            if let Some(parent) = pane.root.parent() {
+                if let Ok(parent_box) = parent.downcast::<gtk4::Box>() {
+                    parent_box.remove(&pane.root);
+                }
+            }
+        }
+    }
+
+    // 3. Clear outer_box (now only contains empty row_boxes / row separators)
+    while let Some(child) = outer_box.first_child() {
+        outer_box.remove(&child);
+    }
+
+    // 4. Rebuild grid in chunks of 2
+    let panes_info: Vec<(gtk4::Box, gtk4::ScrolledWindow)> = {
+        let s = state.borrow();
+        s.panes.iter().map(|p| (p.root.clone(), p.scrolled.clone())).collect()
+    };
+
+    let n = panes_info.len();
+    let mut i = 0;
+    let mut first_row = true;
+
+    while i < n {
+        if !first_row {
+            let hsep = gtk4::Separator::new(gtk4::Orientation::Horizontal);
+            outer_box.append(&hsep);
+        }
+        first_row = false;
+
+        let row_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        row_box.set_vexpand(true);
+        row_box.set_hexpand(true);
+
+        let (root_a, sw_a) = panes_info[i].clone();
+        root_a.set_hexpand(true);
+
+        if i + 1 < n {
+            let (root_b, sw_b) = panes_info[i + 1].clone();
+            root_b.set_hexpand(true);
+
+            let sep_widget = build_separator_widget(&sw_a, &sw_b, state);
+
+            row_box.append(&root_a);
+            row_box.append(&sep_widget);
+            row_box.append(&root_b);
+
+            i += 2;
+        } else {
+            row_box.append(&root_a);
+            i += 1;
+        }
+
+        outer_box.append(&row_box);
+    }
+}
+
+/// Build the 16 px-wide separator+chain-button widget placed between two panes
+/// in the same row.
+///
+/// The toggle button, when activated, creates four scroll-sync signal handlers
+/// (left↔right for both vertical and horizontal adjustments). Deactivating it
+/// tears them all down again.
+fn build_separator_widget(
+    left_sw: &gtk4::ScrolledWindow,
+    right_sw: &gtk4::ScrolledWindow,
+    state: &State,
+) -> gtk4::Box {
+    let sep_container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    sep_container.set_size_request(16, -1);
+    sep_container.set_vexpand(true);
+
+    let overlay = gtk4::Overlay::new();
+    overlay.set_vexpand(true);
+    overlay.set_hexpand(true);
+
+    let vsep = gtk4::Separator::new(gtk4::Orientation::Vertical);
+    vsep.set_vexpand(true);
+    overlay.set_child(Some(&vsep));
+
+    let chain_btn = gtk4::ToggleButton::new();
+    chain_btn.set_icon_name("insert-link-symbolic");
+    chain_btn.set_tooltip_text(Some("Link scroll (sync vertical & horizontal)"));
+    chain_btn.set_halign(gtk4::Align::Center);
+    chain_btn.set_valign(gtk4::Align::Center);
+    overlay.add_overlay(&chain_btn);
+
+    sep_container.append(&overlay);
+
+    // Per-button handler list (None while unlinked, Some while linked)
+    let active_hl: Rc<RefCell<Option<HandlerList>>> = Rc::new(RefCell::new(None));
+
+    let left_sw_c = left_sw.clone();
+    let right_sw_c = right_sw.clone();
+    let state_c = state.clone();
+
+    chain_btn.connect_toggled(move |btn| {
+        if btn.is_active() {
+            // ── Link: connect four bidirectional scroll handlers ──────────────
+            let left_vadj = left_sw_c.vadjustment();
+            let right_vadj = right_sw_c.vadjustment();
+            let left_hadj = left_sw_c.hadjustment();
+            let right_hadj = right_sw_c.hadjustment();
+
+            let guard_v = Rc::new(Cell::new(false));
+            let guard_h = Rc::new(Cell::new(false));
+
+            let hl: HandlerList = Rc::new(RefCell::new(Vec::new()));
+
+            // left_v → right_v
+            {
+                let guard = guard_v.clone();
+                let right = right_vadj.clone();
+                let id = left_vadj.connect_value_changed(move |adj| {
+                    if guard.get() { return; }
+                    guard.set(true);
+                    right.set_value(adj.value());
+                    guard.set(false);
+                });
+                hl.borrow_mut().push((left_vadj.clone(), id));
+            }
+
+            // right_v → left_v
+            {
+                let guard = guard_v.clone();
+                let left = left_vadj.clone();
+                let id = right_vadj.connect_value_changed(move |adj| {
+                    if guard.get() { return; }
+                    guard.set(true);
+                    left.set_value(adj.value());
+                    guard.set(false);
+                });
+                hl.borrow_mut().push((right_vadj.clone(), id));
+            }
+
+            // left_h → right_h
+            {
+                let guard = guard_h.clone();
+                let right = right_hadj.clone();
+                let id = left_hadj.connect_value_changed(move |adj| {
+                    if guard.get() { return; }
+                    guard.set(true);
+                    right.set_value(adj.value());
+                    guard.set(false);
+                });
+                hl.borrow_mut().push((left_hadj.clone(), id));
+            }
+
+            // right_h → left_h
+            {
+                let guard = guard_h.clone();
+                let left = left_hadj.clone();
+                let id = right_hadj.connect_value_changed(move |adj| {
+                    if guard.get() { return; }
+                    guard.set(true);
+                    left.set_value(adj.value());
+                    guard.set(false);
+                });
+                hl.borrow_mut().push((right_hadj.clone(), id));
+            }
+
+            // Store the list so we can find it on unlink
+            *active_hl.borrow_mut() = Some(hl.clone());
+            state_c.borrow_mut().active_handler_lists.push(hl);
+        } else {
+            // ── Unlink: disconnect handlers and remove from state ─────────────
+            if let Some(hl) = active_hl.borrow_mut().take() {
+                for (adj, id) in hl.borrow_mut().drain(..) {
+                    adj.disconnect(id);
+                }
+                state_c
+                    .borrow_mut()
+                    .active_handler_lists
+                    .retain(|h| !Rc::ptr_eq(h, &hl));
+            }
+        }
+    });
+
+    sep_container
+}
+
+/// Return the `sourceview5::View` of the currently active pane, if any.
+fn current_view(state: &State) -> Option<sourceview5::View> {
+    let s = state.borrow();
+    let active_root = s.active.as_ref()?;
+    s.panes
+        .iter()
+        .find(|p| p.root == *active_root)
+        .map(|p| p.editor.view().clone())
 }
 
 // ─── Keyboard shortcuts ───────────────────────────────────────────────────────
 
 fn setup_shortcuts(
     window: &adw::ApplicationWindow,
-    notebook: &gtk4::Notebook,
+    outer_box: &gtk4::Box,
+    state: &State,
+    status_bar: &gtk4::Label,
     search_bar: &gtk4::SearchBar,
 ) {
     // Ctrl+F – toggle search bar
@@ -329,16 +587,18 @@ fn setup_shortcuts(
         window.add_controller(ctrl_f);
     }
 
-    // Ctrl+T – new tab
+    // Ctrl+T – new pane
     {
-        let nb = notebook.clone();
+        let ob = outer_box.clone();
+        let st = state.clone();
+        let sb = status_bar.clone();
         let ctrl_t = gtk4::ShortcutController::new();
         let trigger = gtk4::KeyvalTrigger::new(
             gtk4::gdk::Key::t,
             gtk4::gdk::ModifierType::CONTROL_MASK,
         );
         let action = gtk4::CallbackAction::new(move |_, _| {
-            add_new_tab(&nb, None);
+            add_pane(&ob, &st, &sb, None);
             glib::Propagation::Stop
         });
         ctrl_t.add_shortcut(gtk4::Shortcut::new(Some(trigger), Some(action)));
@@ -347,15 +607,14 @@ fn setup_shortcuts(
 
     // Ctrl+S – save current file
     {
-        let nb = notebook.clone();
+        let st = state.clone();
         let ctrl_s = gtk4::ShortcutController::new();
         let trigger = gtk4::KeyvalTrigger::new(
             gtk4::gdk::Key::s,
             gtk4::gdk::ModifierType::CONTROL_MASK,
         );
         let action = gtk4::CallbackAction::new(move |_, _| {
-            if let Some(view) = current_source_view(&nb) {
-                // Retrieve file path stored as object data
+            if let Some(view) = current_view(&st) {
                 if let Some(path_ptr) =
                     unsafe { view.data::<std::path::PathBuf>("file_path") }
                 {
@@ -380,23 +639,29 @@ fn setup_shortcuts(
 
 fn setup_actions(
     window: &adw::ApplicationWindow,
-    notebook: &gtk4::Notebook,
+    outer_box: &gtk4::Box,
+    state: &State,
+    status_bar: &gtk4::Label,
     search_entry: &gtk4::SearchEntry,
     match_label: &gtk4::Label,
 ) {
     // win.new_tab
     {
-        let nb = notebook.clone();
+        let ob = outer_box.clone();
+        let st = state.clone();
+        let sb = status_bar.clone();
         let action = gio::SimpleAction::new("new_tab", None);
         action.connect_activate(move |_, _| {
-            add_new_tab(&nb, None);
+            add_pane(&ob, &st, &sb, None);
         });
         window.add_action(&action);
     }
 
     // win.open_file
     {
-        let nb = notebook.clone();
+        let ob = outer_box.clone();
+        let st = state.clone();
+        let sb = status_bar.clone();
         let win = window.clone();
         let action = gio::SimpleAction::new("open_file", None);
         action.connect_activate(move |_, _| {
@@ -404,14 +669,16 @@ fn setup_actions(
                 .title("Open File")
                 .modal(true)
                 .build();
-            let nb_clone = nb.clone();
+            let ob2 = ob.clone();
+            let st2 = st.clone();
+            let sb2 = sb.clone();
             dialog.open(
                 Some(&win),
                 None::<&gio::Cancellable>,
                 move |result| {
                     if let Ok(file) = result {
                         if let Some(path) = file.path() {
-                            add_new_tab(&nb_clone, Some(&path));
+                            add_pane(&ob2, &st2, &sb2, Some(&path));
                         }
                     }
                 },
@@ -422,10 +689,10 @@ fn setup_actions(
 
     // win.save_file
     {
-        let nb = notebook.clone();
+        let st = state.clone();
         let action = gio::SimpleAction::new("save_file", None);
         action.connect_activate(move |_, _| {
-            if let Some(view) = current_source_view(&nb) {
+            if let Some(view) = current_view(&st) {
                 if let Some(path_ptr) =
                     unsafe { view.data::<std::path::PathBuf>("file_path") }
                 {
@@ -445,11 +712,11 @@ fn setup_actions(
 
     // win.save_file_as
     {
-        let nb = notebook.clone();
+        let st = state.clone();
         let win = window.clone();
         let action = gio::SimpleAction::new("save_file_as", None);
         action.connect_activate(move |_, _| {
-            if let Some(view) = current_source_view(&nb) {
+            if let Some(view) = current_view(&st) {
                 let dialog = gtk4::FileDialog::builder()
                     .title("Save As")
                     .modal(true)
@@ -466,12 +733,14 @@ fn setup_actions(
                                 let end = buf.end_iter();
                                 let text = buf.text(&start, &end, true);
                                 if std::fs::write(&path, text.as_bytes()).is_ok() {
-                                    // Update the stored path so future Saves work
                                     unsafe {
                                         view_clone.set_data("file_path", path.clone());
                                     }
                                 } else {
-                                    eprintln!("Save As error: could not write to {}", path.display());
+                                    eprintln!(
+                                        "Save As error: could not write to {}",
+                                        path.display()
+                                    );
                                 }
                             }
                         }
@@ -484,16 +753,14 @@ fn setup_actions(
 
     // win.format_code – run the appropriate external formatter
     {
-        let nb = notebook.clone();
+        let st = state.clone();
         let win = window.clone();
         let action = gio::SimpleAction::new("format_code", None);
         action.connect_activate(move |_, _| {
-            let Some(view) = current_source_view(&nb) else {
+            let Some(view) = current_view(&st) else {
                 return;
             };
 
-            // Determine language from the sourceview buffer, with fallback
-            // to guessing from the stored file-path extension.
             let language_id: Option<String> = view
                 .buffer()
                 .downcast::<sourceview5::Buffer>()
@@ -513,7 +780,7 @@ fn setup_actions(
                 show_error_dialog(
                     &win,
                     "Language not detected",
-                    "Could not determine the language for this tab.\n\
+                    "Could not determine the language for this pane.\n\
                      Save the file with the correct extension (e.g. .json, .rs, .py) and try again.",
                 );
                 return;
@@ -532,12 +799,10 @@ fn setup_actions(
                 return;
             };
 
-            // Retrieve the file path stored as object data on the view
             if let Some(path_ptr) =
                 unsafe { view.data::<std::path::PathBuf>("file_path") }
             {
                 let path = unsafe { path_ptr.as_ref().clone() };
-                // Save first so the formatter can read the latest content
                 let buf = view.buffer();
                 let start = buf.start_iter();
                 let end = buf.end_iter();
@@ -545,7 +810,6 @@ fn setup_actions(
                 if std::fs::write(&path, text.as_bytes()).is_ok() {
                     match fmt.format_file(&path) {
                         Ok(()) => {
-                            // Reload formatted content into the buffer
                             if let Ok(formatted) = std::fs::read_to_string(&path) {
                                 buf.set_text(&formatted);
                             }
@@ -566,11 +830,11 @@ fn setup_actions(
 
     // win.show_diff – compare saved version with current editor content
     {
-        let nb = notebook.clone();
+        let st = state.clone();
         let win = window.clone();
         let action = gio::SimpleAction::new("show_diff", None);
         action.connect_activate(move |_, _| {
-            let Some(view) = current_source_view(&nb) else {
+            let Some(view) = current_view(&st) else {
                 return;
             };
 
@@ -579,7 +843,6 @@ fn setup_actions(
             let end = buf.end_iter();
             let current_text = buf.text(&start, &end, true).to_string();
 
-            // Compare against the on-disk version when a file is open
             let saved_text = unsafe { view.data::<std::path::PathBuf>("file_path") }
                 .map(|ptr| unsafe { ptr.as_ref().clone() })
                 .and_then(|path| std::fs::read_to_string(path).ok())
@@ -592,7 +855,7 @@ fn setup_actions(
 
     // Search entry: activate on Enter
     {
-        let nb = notebook.clone();
+        let st = state.clone();
         let ml = match_label.clone();
         let se = search_entry.clone();
         search_entry.connect_activate(move |_| {
@@ -600,7 +863,7 @@ fn setup_actions(
             if pattern.is_empty() {
                 return;
             }
-            if let Some(view) = current_source_view(&nb) {
+            if let Some(view) = current_view(&st) {
                 let buf = view.buffer();
                 let start = buf.start_iter();
                 let end = buf.end_iter();
@@ -609,7 +872,11 @@ fn setup_actions(
                 match regex::Regex::new(&pattern) {
                     Ok(re) => {
                         let count = re.find_iter(&text).count();
-                        ml.set_text(&format!("{} match{}", count, if count == 1 { "" } else { "es" }));
+                        ml.set_text(&format!(
+                            "{} match{}",
+                            count,
+                            if count == 1 { "" } else { "es" }
+                        ));
                     }
                     Err(_) => ml.set_text("invalid regex"),
                 }
@@ -619,16 +886,15 @@ fn setup_actions(
 
     // Search entry: live highlight as user types
     {
-        let nb = notebook.clone();
+        let st = state.clone();
         search_entry.connect_search_changed(move |entry| {
             let pattern = entry.text().to_string();
-            if let Some(view) = current_source_view(&nb) {
+            if let Some(view) = current_view(&st) {
                 let buf = view
                     .buffer()
                     .downcast::<sourceview5::Buffer>()
                     .ok();
                 if let Some(buf) = buf {
-                    // Remove previous tag
                     let start = buf.start_iter();
                     let end = buf.end_iter();
                     buf.remove_tag_by_name("search-highlight", &start, &end);
@@ -637,7 +903,6 @@ fn setup_actions(
                         return;
                     }
 
-                    // Ensure tag exists
                     let tag_table = buf.tag_table();
                     if tag_table.lookup("search-highlight").is_none() {
                         let tag = gtk4::TextTag::new(Some("search-highlight"));
