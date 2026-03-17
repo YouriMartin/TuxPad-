@@ -853,7 +853,7 @@ fn setup_actions(
         window.add_action(&action);
     }
 
-    // Search entry: activate on Enter
+    // Search entry: activate on Enter – case-insensitive, all panes
     {
         let st = state.clone();
         let ml = match_label.clone();
@@ -863,65 +863,94 @@ fn setup_actions(
             if pattern.is_empty() {
                 return;
             }
-            if let Some(view) = current_view(&st) {
-                let buf = view.buffer();
-                let start = buf.start_iter();
-                let end = buf.end_iter();
-                let text = buf.text(&start, &end, true).to_string();
-
-                match regex::Regex::new(&pattern) {
-                    Ok(re) => {
-                        let count = re.find_iter(&text).count();
-                        ml.set_text(&format!(
-                            "{} match{}",
-                            count,
-                            if count == 1 { "" } else { "es" }
-                        ));
-                    }
-                    Err(_) => ml.set_text("invalid regex"),
+            // (?i) makes the match case-insensitive
+            let ci_pattern = format!("(?i){}", pattern);
+            match regex::Regex::new(&ci_pattern) {
+                Ok(re) => {
+                    // Sum matches across every open pane
+                    let views: Vec<sourceview5::View> = st
+                        .borrow()
+                        .panes
+                        .iter()
+                        .map(|p| p.editor.view().clone())
+                        .collect();
+                    let total: usize = views
+                        .iter()
+                        .map(|view| {
+                            let buf = view.buffer();
+                            let text = buf
+                                .text(&buf.start_iter(), &buf.end_iter(), true)
+                                .to_string();
+                            re.find_iter(&text).count()
+                        })
+                        .sum();
+                    ml.set_text(&format!(
+                        "{} match{}",
+                        total,
+                        if total == 1 { "" } else { "es" }
+                    ));
                 }
+                Err(_) => ml.set_text("invalid regex"),
             }
         });
     }
 
-    // Search entry: live highlight as user types
+    // Search entry: live highlight as user types – case-insensitive, all panes
     {
         let st = state.clone();
         search_entry.connect_search_changed(move |entry| {
             let pattern = entry.text().to_string();
-            if let Some(view) = current_view(&st) {
-                let buf = view
-                    .buffer()
-                    .downcast::<sourceview5::Buffer>()
-                    .ok();
-                if let Some(buf) = buf {
-                    let start = buf.start_iter();
-                    let end = buf.end_iter();
-                    buf.remove_tag_by_name("search-highlight", &start, &end);
+            let ci_pattern = if pattern.is_empty() {
+                String::new()
+            } else {
+                format!("(?i){}", pattern)
+            };
 
-                    if pattern.is_empty() {
-                        return;
-                    }
+            // Apply to every pane
+            let views: Vec<sourceview5::View> = st
+                .borrow()
+                .panes
+                .iter()
+                .map(|p| p.editor.view().clone())
+                .collect();
 
-                    let tag_table = buf.tag_table();
-                    if tag_table.lookup("search-highlight").is_none() {
-                        let tag = gtk4::TextTag::new(Some("search-highlight"));
-                        tag.set_background(Some("#f39c12"));
-                        tag.set_foreground(Some("#000000"));
-                        tag_table.add(&tag);
-                    }
+            for view in &views {
+                let buf = match view.buffer().downcast::<sourceview5::Buffer>() {
+                    Ok(b) => b,
+                    Err(_) => continue,
+                };
 
-                    if let Ok(re) = regex::Regex::new(&pattern) {
-                        let text = buf
-                            .text(&buf.start_iter(), &buf.end_iter(), true)
-                            .to_string();
-                        for m in re.find_iter(&text) {
-                            let sc = text[..m.start()].chars().count() as i32;
-                            let ec = text[..m.end()].chars().count() as i32;
-                            let si = buf.iter_at_offset(sc);
-                            let ei = buf.iter_at_offset(ec);
-                            buf.apply_tag_by_name("search-highlight", &si, &ei);
-                        }
+                // Always clear old highlights first
+                buf.remove_tag_by_name(
+                    "search-highlight",
+                    &buf.start_iter(),
+                    &buf.end_iter(),
+                );
+
+                if ci_pattern.is_empty() {
+                    continue;
+                }
+
+                // Ensure the highlight tag exists in this buffer
+                if buf.tag_table().lookup("search-highlight").is_none() {
+                    let tag = gtk4::TextTag::new(Some("search-highlight"));
+                    tag.set_background(Some("#f39c12"));
+                    tag.set_foreground(Some("#000000"));
+                    buf.tag_table().add(&tag);
+                }
+
+                if let Ok(re) = regex::Regex::new(&ci_pattern) {
+                    let text = buf
+                        .text(&buf.start_iter(), &buf.end_iter(), true)
+                        .to_string();
+                    for m in re.find_iter(&text) {
+                        let sc = text[..m.start()].chars().count() as i32;
+                        let ec = text[..m.end()].chars().count() as i32;
+                        buf.apply_tag_by_name(
+                            "search-highlight",
+                            &buf.iter_at_offset(sc),
+                            &buf.iter_at_offset(ec),
+                        );
                     }
                 }
             }
