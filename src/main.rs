@@ -485,27 +485,50 @@ fn setup_actions(
     // win.format_code – run the appropriate external formatter
     {
         let nb = notebook.clone();
+        let win = window.clone();
         let action = gio::SimpleAction::new("format_code", None);
         action.connect_activate(move |_, _| {
             let Some(view) = current_source_view(&nb) else {
                 return;
             };
 
-            // Determine language from the sourceview buffer
+            // Determine language from the sourceview buffer, with fallback
+            // to guessing from the stored file-path extension.
             let language_id: Option<String> = view
                 .buffer()
                 .downcast::<sourceview5::Buffer>()
                 .ok()
                 .and_then(|b| b.language())
-                .map(|l: sourceview5::Language| l.id().to_string());
+                .map(|l: sourceview5::Language| l.id().to_string())
+                .or_else(|| {
+                    let path = unsafe { view.data::<std::path::PathBuf>("file_path") }
+                        .map(|ptr| unsafe { ptr.as_ref().clone() })?;
+                    let name = path.file_name()?.to_str()?;
+                    let lm = sourceview5::LanguageManager::default();
+                    lm.guess_language(Some(name), None)
+                        .map(|l| l.id().to_string())
+                });
 
             let Some(lang_id) = language_id else {
-                eprintln!("Format: cannot determine language for current tab");
+                show_error_dialog(
+                    &win,
+                    "Language not detected",
+                    "Could not determine the language for this tab.\n\
+                     Save the file with the correct extension (e.g. .json, .rs, .py) and try again.",
+                );
                 return;
             };
 
             let Some(fmt) = formatter::Formatter::for_language(&lang_id) else {
-                eprintln!("Format: no formatter available for '{}'", lang_id);
+                show_error_dialog(
+                    &win,
+                    "No formatter available",
+                    &format!(
+                        "No formatter is configured for '{lang_id}'.\n\
+                         Supported languages: Rust (rustfmt), JS/TS/CSS/HTML/JSON (prettier), \
+                         Python (black), C/C++ (clang-format)."
+                    ),
+                );
                 return;
             };
 
@@ -527,9 +550,15 @@ fn setup_actions(
                                 buf.set_text(&formatted);
                             }
                         }
-                        Err(e) => eprintln!("Format error: {}", e),
+                        Err(e) => show_error_dialog(&win, "Format error", &e),
                     }
                 }
+            } else {
+                show_error_dialog(
+                    &win,
+                    "File not saved",
+                    "Please save the file before formatting.",
+                );
             }
         });
         window.add_action(&action);
@@ -633,4 +662,12 @@ fn setup_actions(
             }
         });
     }
+}
+
+// ─── Error dialog helper ──────────────────────────────────────────────────────
+
+fn show_error_dialog(window: &adw::ApplicationWindow, title: &str, message: &str) {
+    let dialog = adw::AlertDialog::new(Some(title), Some(message));
+    dialog.add_response("ok", "OK");
+    dialog.present(Some(window));
 }
